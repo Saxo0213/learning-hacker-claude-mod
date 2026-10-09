@@ -22,6 +22,50 @@ export function truncate(s: string, max: number): string {
   return one.length <= max ? one : `${one.slice(0, max - 1)}…`
 }
 
+// ── 路徑（POSIX 與 Windows）────────────────────────────────────────────────
+
+const DRIVE_ABS_RE = /^[A-Za-z]:[\\/]/
+
+/**
+ * git 給的絕對路徑 → 統一寫法；不是絕對路徑回 null。
+ * POSIX 收 `/` 開頭；Windows 收含磁碟代號的 `C:/…`、`C:\…`（反斜線換成 `/`）；反斜線開頭的 `\\server\share` 不收。
+ */
+export function absPath(raw: string): string | null {
+  const p = raw.trim()
+  if (DRIVE_ABS_RE.test(p)) {
+    const s = p.replace(/\\/g, '/').replace(/\/+$/, '')
+    return /^[A-Za-z]:$/.test(s) ? `${s}/` : s
+  }
+  const s = p.replace(/\/+$/, '')
+  return s.startsWith('/') ? s : null
+}
+
+/** `git -C` 可接受的路徑：POSIX 絕對路徑，或 `C:/…`（absPath 正規化後的寫法）。 */
+export function isAbsPath(p: string | undefined): boolean {
+  return p !== undefined && (p.startsWith('/') || /^[A-Za-z]:\//.test(p))
+}
+
+/** Windows 上 Git for Windows 附的 POSIX 工具（`mkdir`／`rmdir`）的候選位置，依序嘗試；系統目錄底下的不收。 */
+export function gitToolCandidates(
+  tool: 'mkdir' | 'rmdir',
+  env: { gitBash?: string; programFiles?: string; programW6432?: string; localAppData?: string },
+): string[] {
+  const roots: string[] = []
+  const bash = env.gitBash?.trim().replace(/\\/g, '/')
+  // CLAUDE_CODE_GIT_BASH_PATH 是 <Git>/bin/bash.exe 或 <Git>/usr/bin/bash.exe
+  const m = bash && DRIVE_ABS_RE.test(bash) ? /^(.*?)\/(?:usr\/)?bin\/bash\.exe$/i.exec(bash) : null
+  if (m?.[1]) roots.push(m[1])
+  for (const base of [env.programFiles, env.programW6432, 'C:/Program Files']) if (base?.trim()) roots.push(`${base.trim()}/Git`)
+  if (env.localAppData?.trim()) roots.push(`${env.localAppData.trim()}/Programs/Git`)
+  const out: string[] = []
+  for (const r of roots) {
+    const p = `${r.replace(/\\/g, '/').replace(/\/+$/, '')}/usr/bin/${tool}.exe`
+    if (!DRIVE_ABS_RE.test(p) || /^[A-Za-z]:\/windows\//i.test(p)) continue
+    if (!out.some(x => x.toLowerCase() === p.toLowerCase())) out.push(p)
+  }
+  return out
+}
+
 export function short(sha: string | null | undefined): string {
   return sha ? sha.slice(0, 8) : '無法解析'
 }
@@ -204,7 +248,7 @@ export function fingerprint(steps: Step[]): string {
 
 /** 執行步驟允許的形狀：`git -C <絕對路徑> {merge --ff-only|update-ref|push}`，不得帶強制選項。 */
 export function argvAllowed(argv: readonly string[]): boolean {
-  if (argv[0] !== 'git' || argv[1] !== '-C' || !argv[2]?.startsWith('/')) return false
+  if (argv[0] !== 'git' || argv[1] !== '-C' || !isAbsPath(argv[2])) return false
   const rest = argv.slice(3)
   if (rest.some(a => a === '-f' || a.startsWith('--force') || a.startsWith('+') || a === '--delete' || a === '-d')) return false
   if (rest[0] === 'merge') return rest[1] === '--ff-only' && rest.length === 3

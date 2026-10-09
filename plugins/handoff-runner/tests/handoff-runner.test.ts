@@ -6,7 +6,7 @@
 
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { bandText, preflight } from '../hooks/logic'
+import { absPath, argvAllowed, bandText, gitToolCandidates, preflight } from '../hooks/logic'
 import type { Rendered, TicketRow } from '../types'
 
 const ROOT = '/repo'
@@ -30,15 +30,35 @@ type World = {
   writes: string[][]
   toasts: string[]
   prompts: string[]
+  /** repo 根目錄、common dir、bg session 的 worktree */
+  root: string
+  git: string
+  wt: string
+  /** `rev-parse --git-common-dir` 的輸出（Windows 的 git 給 `C:/…`） */
+  commonOut: string
+  /** fs.exists 為真的路徑（Git for Windows 的工具） */
+  exists: Set<string>
+  /** git 以外每次 process.run 的 argv[0] */
+  procs: string[]
+  /** Windows：PATH 上有沒有 mkdir／rmdir */
+  pathTools: boolean
 }
 
-function newWorld(): World {
+function newWorld(root = ROOT): World {
+  const wt = `${root}/.claude/worktrees/x`
   return {
+    root,
+    git: `${root}/.git`,
+    wt,
+    commonOut: `${root}/.git\n`,
+    exists: new Set(),
+    procs: [],
+    pathTools: false,
     commits: { [C0]: { parent: null, files: ['README.md'] }, [C1]: { parent: C0, files: ['a.txt'] }, [C2]: { parent: C1, files: ['b.txt'] } },
     branches: { main: C0, 'feature/x': C1 },
     trees: [
-      { path: ROOT, branch: 'main' },
-      { path: WT, branch: 'feature/x' },
+      { path: root, branch: 'main' },
+      { path: wt, branch: 'feature/x' },
     ],
     dirty: {},
     remote: null,
@@ -75,7 +95,7 @@ function fakeGit(w: World, argv: string[], cwd: string): { exitCode: number; std
   const [sub, ...rest] = args
   switch (sub) {
     case 'rev-parse': {
-      if (rest.includes('--git-common-dir')) return { exitCode: 0, stdout: `${GIT}\n` }
+      if (rest.includes('--git-common-dir')) return { exitCode: 0, stdout: w.commonOut }
       const r = revParse(w, cwd, rest[rest.length - 1]!)
       return r ? { exitCode: 0, stdout: `${r}\n` } : { exitCode: 1 }
     }
@@ -137,30 +157,41 @@ function engine(on: any, w: World): void {
   })
   on('process.run', (_$: any, e: any) => {
     const argv: string[] = [...e.argv]
-    const cwd = e.init?.cwd ?? WT
+    const cwd = e.init?.cwd ?? w.wt
     if (argv[0] === 'git') return proc(fakeGit(w, argv, cwd))
-    if (argv[0] === 'mkdir') {
+    w.procs.push(argv[0]!)
+    // Windows：Git for Windows 的 usr/bin/*.exe 只在 w.exists 裡才有；PATH 上的 mkdir／rmdir 只在 w.pathTools 時有，否則啟動失敗
+    const tool = w.exists.has(argv[0]!) ? argv[0]!.replace(/^.*\/(\w+)\.exe$/, '$1') : !/^[A-Za-z]:\//.test(w.root) || w.pathTools ? argv[0] : null
+    if (tool === null) return { deny: `ENOENT: ${argv[0]}` }
+    if (tool === 'mkdir') {
       if (w.dirs.has(argv[1]!)) return proc({ exitCode: 1, stderr: 'File exists' })
       w.dirs.add(argv[1]!)
       return proc({ exitCode: 0 })
     }
-    if (argv[0] === 'rmdir') {
+    if (tool === 'rmdir') {
       w.dirs.delete(argv[1]!)
       return proc({ exitCode: 0 })
     }
     return proc({ exitCode: 127, stderr: 'not found' })
   })
-  on('fs.read', (_$: any, e: any) => (w.files.has(e.path) ? value(w.files.get(e.path)) : { deny: `ENOENT: ${e.path}` }))
+  // 引擎在 Windows 主機上會把 `/repo/…` 解析成 `D:\repo\…` 再交給 fs.*：比對前先還原成 `/repo/…`。
+  // Windows 世界（ROOT 是 `C:/…`）的路徑保留磁碟代號，只把反斜線換成 `/`。
+  const fsPath = (p: string) => {
+    const s = p.replace(/\\/g, '/')
+    return /^[A-Za-z]:\//.test(w.root) ? s : s.replace(/^[A-Za-z]:(?=\/)/, '')
+  }
+  on('fs.exists', (_$: any, e: any) => value(w.exists.has(fsPath(e.path))))
+  on('fs.read', (_$: any, e: any) => (w.files.has(fsPath(e.path)) ? value(w.files.get(fsPath(e.path))) : { deny: `ENOENT: ${e.path}` }))
   on('fs.write', (_$: any, e: any) => {
-    w.files.set(e.path, e.text)
+    w.files.set(fsPath(e.path), e.text)
     return value(undefined)
   })
   on('fs.list', (_$: any, e: any) => {
-    const prefix = `${e.path}/`
+    const prefix = `${fsPath(e.path)}/`
     const names = [...w.files.keys()].filter(p => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
     return value(names.map(p => ({ name: p.slice(prefix.length), kind: 'file', size: 0, mtimeMs: 0, isLink: false })))
   })
-  on('session.cwd', () => value(WT))
+  on('session.cwd', () => value(w.wt))
   on('command.register', (_$: any, e: any) => value({ command: e.name }))
   on('tool.register', (_$: any, e: any) => value({ tool: `mcp__handoff-runner__${e.name}` }))
   on('ui.toast', (_$: any, e: any) => {
@@ -175,9 +206,9 @@ function engine(on: any, w: World): void {
   })
 }
 
-async function start($: any, on: any): Promise<void> {
+async function start($: any, on: any, cwd = WT): Promise<void> {
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
-  await $.session.start({ cwd: WT, surface: null, isInteractive: false })
+  await $.session.start({ cwd, surface: null, isInteractive: false })
 }
 
 async function issue($: any, args: Record<string, unknown> = { branch: 'feature/x' }): Promise<any> {
@@ -204,7 +235,7 @@ function ticketIds(w: World): string[] {
 }
 
 function result(w: World, id: string): any {
-  const text = w.files.get(`${GIT}/handoffs/${id}.result.json`)
+  const text = w.files.get(`${w.git}/handoffs/${id}.result.json`)
   return text ? JSON.parse(text) : null
 }
 
@@ -248,6 +279,35 @@ describe('logic', () => {
       const evil = r({ steps: [{ name: 'S1', label: '', argv, done_already: false, detail: '' }] })
       expect(preflight(evil, evil)).toBe('mismatch')
     }
+  })
+
+  test('Windows：git 給的 C:/… 是絕對路徑；反斜線網路路徑、磁碟相對、相對路徑都不是', async () => {
+    expect(absPath('C:/repo/.git\n')).toBe('C:/repo/.git')
+    expect(absPath('C:\\repo\\.git\\')).toBe('C:/repo/.git')
+    expect(absPath('C:/')).toBe('C:/')
+    expect(absPath('/repo/.git/')).toBe('/repo/.git')
+    for (const bad of ['\\\\server\\share\\.git', 'C:repo', 'repo/.git', '.git', '', '/']) expect(absPath(bad)).toBe(null)
+    expect(argvAllowed(['git', '-C', 'C:/repo', 'merge', '--ff-only', C1])).toBe(true)
+    expect(argvAllowed(['git', '-C', 'C:/repo', 'update-ref', '-m', 'm', 'refs/heads/main', C1, C0])).toBe(true)
+    for (const dir of ['C:repo', 'repo', '\\\\server\\share', 'C:\\repo']) {
+      expect(argvAllowed(['git', '-C', dir, 'merge', '--ff-only', C1])).toBe(false)
+    }
+    expect(argvAllowed(['git', '-C', 'C:/repo', 'push', '--force', 'origin', `${C1}:refs/heads/main`])).toBe(false)
+  })
+
+  test('Windows：mkdir／rmdir 只從 Git for Windows 的 usr/bin 找，不收系統目錄', async () => {
+    expect(gitToolCandidates('mkdir', { gitBash: 'D:\\Git\\bin\\bash.exe', programFiles: 'C:\\Program Files' })).toEqual([
+      'D:/Git/usr/bin/mkdir.exe',
+      'C:/Program Files/Git/usr/bin/mkdir.exe',
+    ])
+    expect(gitToolCandidates('rmdir', { gitBash: 'D:\\Git\\usr\\bin\\bash.exe', localAppData: 'C:\\Users\\Me\\AppData\\Local' })).toEqual([
+      'D:/Git/usr/bin/rmdir.exe',
+      'C:/Program Files/Git/usr/bin/rmdir.exe',
+      'C:/Users/Me/AppData/Local/Programs/Git/usr/bin/rmdir.exe',
+    ])
+    expect(gitToolCandidates('mkdir', { gitBash: 'C:\\Windows\\System32\\bash.exe', programFiles: 'C:\\Windows' })).toEqual([
+      'C:/Program Files/Git/usr/bin/mkdir.exe',
+    ])
   })
 })
 
@@ -501,5 +561,76 @@ describe('執行', () => {
     await ui.unmount()
     await clock.settle()
     expect(w.writes.map(a => a.slice(3).join(' '))).toEqual([`merge --ff-only ${C1}`])
+  })
+})
+
+// ── Windows ─────────────────────────────────────────────────────────────────
+
+describe('Windows', () => {
+  const W_ROOT = 'C:/repo'
+  const MKDIR = 'C:/Program Files/Git/usr/bin/mkdir.exe'
+  const RMDIR = 'C:/Program Files/Git/usr/bin/rmdir.exe'
+
+  async function readyWin($: any, on: any, w: World): Promise<{ clock: any; id: string }> {
+    const clock = mock.clock(on)
+    mock.env(on, { USERPROFILE: 'C:\\Users\\Me', ProgramFiles: 'C:\\Program Files' })
+    engine(on, w)
+    await start($, on, w.wt)
+    await issue($)
+    await command($)
+    await clock.settle()
+    return { clock, id: ticketIds(w)[0]! }
+  }
+
+  test('git 給反斜線的 common dir：照樣簽發、執行（git -C C:/repo），認領鎖用 Git for Windows 的 mkdir／rmdir', async ($, on) => {
+    const w = newWorld(W_ROOT)
+    w.commonOut = 'C:\\repo\\.git\\\n'
+    w.exists.add(MKDIR).add(RMDIR)
+    const { clock, id } = await readyWin($, on, w)
+    expect(w.files.has(`${W_ROOT}/.git/handoffs/${id}.json`)).toBe(true)
+    const ui = await mountPane($)
+    await ui.press({ key: `run:${id}` })
+    await ui.unmount()
+    await clock.settle()
+    expect(w.writes).toEqual([['git', '-C', W_ROOT, 'merge', '--ff-only', C1]])
+    expect(w.procs).toEqual([MKDIR, RMDIR])
+    expect(result(w, id).outcome).toBe('passed')
+    expect(w.dirs.size).toBe(0)
+  })
+
+  test('Git for Windows 不在預設位置但 PATH 上有 mkdir：用 PATH 上的', async ($, on) => {
+    const w = newWorld(W_ROOT)
+    w.pathTools = true
+    const { clock, id } = await readyWin($, on, w)
+    const ui = await mountPane($)
+    await ui.press({ key: `run:${id}` })
+    await ui.unmount()
+    await clock.settle()
+    expect(w.procs).toEqual(['mkdir', 'rmdir'])
+    expect(result(w, id).outcome).toBe('passed')
+  })
+
+  test('哪裡都找不到 mkdir：零次寫入，toast 說明原因（不當成鎖被別人拿走）', async ($, on) => {
+    const w = newWorld(W_ROOT)
+    const { clock, id } = await readyWin($, on, w)
+    const ui = await mountPane($)
+    await ui.press({ key: `run:${id}` })
+    await ui.unmount()
+    await clock.settle()
+    expect(w.writes).toEqual([])
+    expect(w.procs).toEqual(['mkdir'])
+    expect(result(w, id)).toBe(null)
+    expect(w.toasts.some(t => t.includes('找不到 Git for Windows 的 mkdir.exe'))).toBe(true)
+  })
+
+  test('common dir 是反斜線網路路徑：當成不在 repo，不簽發', async ($, on) => {
+    const w = newWorld(W_ROOT)
+    w.commonOut = '\\\\server\\share\\repo\\.git\n'
+    mock.env(on, {})
+    engine(on, w)
+    await start($, on, w.wt)
+    const r = await issue($)
+    expect(r.deny ?? String(r.result)).toMatch(/不在 git repo/)
+    expect(ticketIds(w)).toEqual([])
   })
 })

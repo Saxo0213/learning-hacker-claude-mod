@@ -99,7 +99,7 @@ mission 檔格式與範例見 [plugins/dispatch-board/README.md](plugins/dispatc
 
 ## 安裝前看看它會做什麼
 
-mod 不在沙盒裡執行，會以你的權限跑在 Claude Code 內。建議安裝前先讀原始碼，或 clone 後執行 `claude plugin validate ./plugins/<名稱>`，看它處理哪些事件、呼叫哪些能力。以下是 v0.1.0 的結果：
+mod 不在沙盒裡執行，會以你的權限跑在 Claude Code 內。建議安裝前先讀原始碼，或 clone 後執行 `claude plugin validate ./plugins/<名稱>`，看它處理哪些事件、呼叫哪些能力。以下是各 mod 目前版本的結果：
 
 **dispatch-board**
 
@@ -111,7 +111,7 @@ calls: $.clock.every, $.clock.now, $.command.register, $.env.get, $.fs.exists, $
        $.state.set, $.ui.close, $.ui.copy, $.ui.open, $.ui.resolve, $.ui.toast
 ```
 
-`$.process.run` 只用來跑你 mission 檔裡的完成條件（`/bin/sh -c`，每條 5 秒逾時）和 `claude agents --json`；檔案只讀不寫；不連網、不呼叫模型、不送 prompt。
+`$.process.run` 只用來跑你 mission 檔裡的完成條件（`sh -c`，每條 5 秒逾時；POSIX 用 `/bin/sh`，Windows 用 Git for Windows 的 `sh.exe`）和 `claude agents --json`；檔案只讀不寫；不連網、不呼叫模型、不送 prompt。
 
 **dispatch-relay**
 
@@ -130,12 +130,12 @@ calls: $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat, $.process.run, $
 ```
 hooks: session.start, tool.call{tool=mcp__handoff-runner__handoff_issue}, command.run{command=handoff},
        ui.close, ui.render{component=AbovePrompt}, ui.render{component=Pane, requestId=handoff-runner}
-calls: $.clock.every, $.command.register, $.fs.list, $.fs.read, $.fs.write, $.process.run,
-       $.session.cwd, $.state.get, $.state.set, $.tool.register, $.ui.close, $.ui.open,
+calls: $.clock.every, $.command.register, $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.write,
+       $.process.run, $.session.cwd, $.state.get, $.state.set, $.tool.register, $.ui.close, $.ui.open,
        $.ui.resolve, $.ui.toast
 ```
 
-檔案只讀寫 `<git common dir>/handoffs/` 底下；`$.process.run` 只跑唯讀的 git 檢查、交接單的鎖，以及你按下「執行」後的落地步驟；只有開啟 push 時才連網；不呼叫模型、不送 prompt。
+檔案只讀寫 `<git common dir>/handoffs/` 底下；`$.process.run` 只跑唯讀的 git 檢查、交接單的鎖（`mkdir`／`rmdir`；Windows 用 Git for Windows 附的，`$.env.get`／`$.fs.exists` 只用來找它），以及你按下「執行」後的落地步驟；只有開啟 push 時才連網；不呼叫模型、不送 prompt。
 
 **working-memory**
 

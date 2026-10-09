@@ -24,30 +24,72 @@ export function truncate(s: string, max: number): string {
 // relay 會把 mission 檔指定的結果檔內容送給另一個 session，所以 mission 檔只從使用者層級的目錄讀：
 // 家目錄底下、不在任何 git 工作樹內、也不在本 session 的專案目錄內。
 
-/** 設定值 → 絕對路徑；只收 `~`、`~/…` 或絕對路徑。 */
+// ── 路徑：POSIX 與 Windows ──────────────────────────────────────────────────
+// Windows 路徑（`C:\…`、`C:/…`、`\\server\share`、`\\?\C:\…`）一律先正規化：反斜線換成 `/`、
+// 去掉 `\\?\` 前綴、磁碟代號轉大寫；比對不分大小寫。POSIX 路徑原樣、分大小寫。
+// 不同磁碟、網路路徑（UNC）與 POSIX 路徑彼此永遠不算「在底下」。
+
+const DRIVE_ABS_RE = /^[A-Za-z]:[\\/]/
+
+/** 含磁碟代號的絕對路徑，或反斜線開頭的網路／裝置路徑。 */
+export function isWinPath(p: string): boolean {
+  return DRIVE_ABS_RE.test(p) || p.startsWith('\\\\')
+}
+
+/** Windows 路徑 → `C:/…` 或 `//server/share/…`；POSIX 路徑原樣。 */
+export function normPath(p: string): string {
+  if (!isWinPath(p)) return p
+  let s = p.replace(/\\/g, '/')
+  if (/^\/\/\?\/UNC\//i.test(s)) s = `//${s.slice('//?/UNC/'.length)}`
+  else if (s.startsWith('//?/')) s = s.slice('//?/'.length)
+  return /^[a-z]:/.test(s) ? `${s.charAt(0).toUpperCase()}${s.slice(1)}` : s
+}
+
+/** 比對用的鍵：正規化、去掉結尾斜線；Windows 路徑轉小寫（檔案系統不分大小寫）。 */
+function pathKey(p: string): string {
+  const n = normPath(p).replace(/\/+$/, '')
+  return isWinPath(p) ? n.toLowerCase() : n
+}
+
+/**
+ * 家目錄：Windows 先取 USERPROFILE（含磁碟代號才算），再退 HOME；HOME 只收 POSIX 絕對路徑或含磁碟代號的路徑。
+ * 網路路徑的家目錄不支援。回 null＝讀不到。
+ */
+export function pickHome(userProfile: string | undefined, home: string | undefined): string | null {
+  if (userProfile && DRIVE_ABS_RE.test(userProfile)) return normPath(userProfile)
+  if (home && DRIVE_ABS_RE.test(home)) return normPath(home)
+  if (home && home.startsWith('/')) return home
+  return null
+}
+
+/** 設定值 → 絕對路徑；只收 `~`、`~/…` 或絕對路徑（Windows 家目錄另收 `~\…` 與 `C:\…`、`C:/…`，不收網路路徑）。 */
 export function expandDir(raw: string, home: string): { ok: true; path: string } | { ok: false; error: string } {
   const text = raw.trim()
   if (!text) return { ok: false, error: 'missions_dir 是空的' }
   if (text.includes('\0')) return { ok: false, error: 'missions_dir 含不合法字元' }
+  const win = isWinPath(home)
   if (text === '~') return { ok: true, path: home }
-  if (text.startsWith('~/')) return { ok: true, path: `${home}/${text.slice(2)}` }
+  if (text.startsWith('~/') || (win && text.startsWith('~\\'))) return { ok: true, path: normPath(`${home}/${text.slice(2)}`) }
+  if (win) {
+    if (DRIVE_ABS_RE.test(text)) return { ok: true, path: normPath(text) }
+    return { ok: false, error: `missions_dir 須為 ~/…、~\\… 或含磁碟代號的絕對路徑，不收網路路徑（收到 ${truncate(text, 60)}）` }
+  }
   if (text.startsWith('/')) return { ok: true, path: text }
   return { ok: false, error: `missions_dir 須為 ~/… 或絕對路徑（收到 ${truncate(text, 60)}）` }
 }
 
 export function isUnder(child: string, parent: string): boolean {
-  const p = parent.replace(/\/+$/, '')
-  return child.startsWith(`${p}/`)
+  return pathKey(child).startsWith(`${pathKey(parent)}/`)
 }
 
 export function isSameOrUnder(child: string, parent: string): boolean {
-  return child === parent.replace(/\/+$/, '') || isUnder(child, parent)
+  return pathKey(child) === pathKey(parent) || isUnder(child, parent)
 }
 
 /** realDir 往上到（不含）realHome 的每一層：檢查 `.git` 用。 */
 export function gitProbePaths(realDir: string, realHome: string): string[] {
   const out: string[] = []
-  let p = realDir.replace(/\/+$/, '')
+  let p = normPath(realDir).replace(/\/+$/, '')
   while (isUnder(p, realHome)) {
     out.push(`${p}/.git`)
     p = p.slice(0, p.lastIndexOf('/'))
@@ -112,13 +154,13 @@ function optString(v: unknown, field: string, max: number): string {
 }
 
 /**
- * 結果檔的相對路徑：拒絕絕對路徑、`~`、反斜線與任何 `.`／`..` 段——relay 會把它的內容送出去，
- * 路徑只能落在 session 根目錄底下。實際讀檔前另以解析後的路徑再確認一次（防符號連結）。
+ * 結果檔的相對路徑：拒絕絕對路徑、`~`、反斜線、冒號（Windows 的磁碟代號與 NTFS 資料流）與任何 `.`／`..` 段——
+ * relay 會把它的內容送出去，路徑只能落在 session 根目錄底下。實際讀檔前另以解析後的路徑再確認一次（防符號連結）。
  */
 export function checkResultFile(raw: string): { ok: true; path: string } | { ok: false; error: string } {
   const text = raw.trim()
   if (!text) return { ok: true, path: DEFAULT_RESULT_FILE }
-  if (text.includes('\0') || text.includes('\\')) return { ok: false, error: 'result_file 含不合法字元' }
+  if (text.includes('\0') || text.includes('\\') || text.includes(':')) return { ok: false, error: 'result_file 含不合法字元' }
   if (text.startsWith('/') || text.startsWith('~')) return { ok: false, error: 'result_file 必須是相對於 session 根目錄的路徑' }
   const segs = text.split('/')
   if (segs.some(s => s === '' || s === '.' || s === '..')) return { ok: false, error: 'result_file 不能含空段、. 或 ..' }

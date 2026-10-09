@@ -79,7 +79,8 @@ shop-redesign  ▓▓▓░░░░░░░ 1/3  商店改版
 
 ### 完成條件怎麼求值
 
-- 用 `/bin/sh -c` 執行，工作目錄是家目錄，每條 5 秒逾時，最多同時跑 4 條。
+- 用 `sh -c` 執行，工作目錄是家目錄，每條 5 秒逾時，最多同時跑 4 條。
+- macOS／Linux 用 `/bin/sh`。Windows 用 Git for Windows 的 `sh.exe`：依序找 `CLAUDE_CODE_GIT_BASH_PATH` 旁的 `sh.exe`、`%ProgramFiles%\Git\bin\sh.exe`、`%LOCALAPPDATA%\Programs\Git\bin\sh.exe`，再試 PATH 上的 `sh`；都沒有時每個條件都是「無法判定」（不改用 cmd，也不用 `System32\bash.exe`，那是 WSL）。條件照 POSIX shell 的寫法寫，路徑寫成 `C:/…` 或 `/c/…`。
 - 退出碼 0＝完成；其他退出碼＝還沒完成。
 - **逾時、指令跑不起來（shell 回 126／127）＝無法判定**，顯示 ✗ 並歸到「需要你」，不會畫成「還在跑」。壞掉的條件如果被當成還沒完成，你會一直等下去。
 - 面板開著時每 5 秒求值一次，關著時每 30 秒一次。目錄裡沒有 mission 檔時只列目錄，不執行任何指令、不讀名冊。
@@ -113,7 +114,8 @@ shop-redesign  ▓▓▓░░░░░░░ 1/3  商店改版
 - 預設目錄 `~/.claude/missions/`。可以在 `/plugin` 的設定改 `missions_dir`（`~/…` 或絕對路徑），但**只認 `~/.claude/settings.json` 裡的值**；專案的 `.claude/settings.json`、`settings.local.json` 或 `--settings` 給的值一律不採用。
 - 目錄解析符號連結後必須在家目錄底下（不能是家目錄本身），不能在本 session 的專案目錄內，也不能在任何 git 工作樹內（從該目錄往上到家目錄之間任一層有 `.git` 就拒讀）。
 - 個別 mission 檔經符號連結指到目錄外的，拒讀並列在「讀不了的 mission 檔」。
-- 讀不到家目錄（`HOME` 未設定）就整個停用。
+- 家目錄：Windows 取 `USERPROFILE`（要含磁碟代號），其他取 `HOME`；讀不到或解析不了就整個停用。網路路徑（`\\server\share`）的家目錄不支援。
+- Windows 上路徑比對前先統一斜線、不分大小寫；`missions_dir` 收 `~/…`、`~\…`、`C:\…`、`C:/…`，不收網路路徑；不同磁碟一律算在家目錄外。
 - 任何一條不符合都直接拒讀並在 band 顯示原因，不會退而求其次改讀別處。
 
 除此之外 mod 是唯讀的：不寫檔、不送 prompt、不碰其他 session。
@@ -124,7 +126,7 @@ shop-redesign  ▓▓▓░░░░░░░ 1/3  商店改版
 claude plugin validate ./plugins/dispatch-board
 ```
 
-結果（v0.1.0）：
+結果（v0.1.1）：
 
 ```
 hooks: session.start, command.run{command=dispatch}, ui.close,
@@ -134,11 +136,13 @@ calls: $.clock.every, $.clock.now, $.command.register, $.env.get,
        $.process.run, $.session.cwd, $.session.root, $.settings.read,
        $.state.get, $.state.set, $.ui.close, $.ui.copy, $.ui.open,
        $.ui.resolve, $.ui.toast
-env reads: DISPATCH_BOARD_DEMO, HOME
+env reads: CLAUDE_CODE_GIT_BASH_PATH, DISPATCH_BOARD_DEMO, HOME, LOCALAPPDATA, ProgramFiles,
+           ProgramW6432, USERPROFILE
 env writes: nothing
 ```
 
-- `$.process.run`：執行 mission 檔的完成條件（`/bin/sh -c`），以及 `claude agents --json`
+- `$.process.run`：執行 mission 檔的完成條件（`sh -c`），以及 `claude agents --json`；Windows 上 Git for Windows 不在預設位置時，另跑一次 `sh -c 'exit 0'` 確認 PATH 上的 `sh` 能用
+- `$.env.get`：家目錄（`USERPROFILE`／`HOME`）、demo 開關，以及 Windows 上找 Git for Windows 用的 `CLAUDE_CODE_GIT_BASH_PATH`、`ProgramFiles`、`ProgramW6432`、`LOCALAPPDATA`
 - `$.fs.*`：只讀 mission 目錄與檢查安全邊界（解析路徑、找 `.git`）；沒有寫檔
 - `$.settings.read`：只讀使用者層級設定，確認自訂的 `missions_dir` 從哪裡來
 - 不連網、不呼叫模型
@@ -147,7 +151,7 @@ env writes: nothing
 
 - 只在終端機與 Claude Desktop 的 Code 分頁畫；`claude -p` 不輪詢。
 - 每個開著的互動 session 各自輪詢；session 開得多，完成條件就會被多個 session 重複執行，條件請保持便宜、沒有副作用。
-- 完成條件依賴 `/bin/sh`，Windows 未測試。
+- Windows 需要 Git for Windows（完成條件用它的 `sh.exe`）。
 
 ## 開發
 

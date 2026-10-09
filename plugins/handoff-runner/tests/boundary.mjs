@@ -3,7 +3,8 @@
 // plugin test 驗證「沒按就不執行」的行為；這裡驗證「程式碼裡沒有別的入口」：
 // - register.tsx 不送 prompt、不派 subagent、不呼叫 model、不 spawn。
 // - register.tsx 的 `$.process.run` 只有四種：host 的 `['git', ...args]`（唯讀，由 git.ts 的 roGit 把關）、
-//   `['mkdir', path]`、`['rmdir', path]`，以及 runTicket 裡執行步驟的 `argv`。
+//   `[mkdir, path]`、`[rmdir, path]`（兩者只由 posixTool 取得：POSIX 為 PATH 上的 mkdir／rmdir，
+//   Windows 為 Git for Windows 的 usr/bin/*.exe），以及 runTicket 裡執行步驟的 `argv`。
 // - runTicket 只從按鈕的 onPress 呼叫。
 // - git.ts 只在 roGit 裡呼叫 host.git，白名單不含任何寫入型子命令；logic.ts 不碰 `$`。
 //
@@ -48,10 +49,16 @@ export function violations({ register, git, logic }) {
   const calls = [...reg.matchAll(/\$\.process\.run\(\s*(\[[^\]]*\]|[^,)]+)/g)]
   for (const m of calls) {
     const arg = m[1].trim()
-    if (arg === "['git', ...args]" || arg === "['mkdir', path]" || arg === "['rmdir', path]") continue
+    if (arg === "['git', ...args]" || arg === '[mkdir, path]' || arg === '[rmdir, path]') continue
     if (arg === 'argv' && run.includes(m[0])) continue
     out.push(`register.tsx：未預期的 $.process.run(${arg})`)
   }
+  // `mkdir`／`rmdir` 只能來自 posixTool（POSIX 回工具名，Windows 回 Git for Windows 的 usr/bin/*.exe）
+  for (const tool of ['mkdir', 'rmdir']) {
+    if (reg.split(`const ${tool} = await posixTool($, '${tool}', path)`).length !== 2) out.push(`${tool} 不是由 posixTool 取得`)
+  }
+  const pt = body(reg, 'posixTool')
+  if (!/if \(path\.startsWith\('\/'\)\) return tool\s*$/m.test(pt) || !pt.includes('gitToolCandidates(tool, env)')) out.push('posixTool 回傳了工具名或 Git for Windows 候選以外的東西')
   if (!run.includes('$.process.run(argv')) out.push('runTicket 內找不到唯一的執行點')
   if (reg.split('$.process.run(argv').length !== 2) out.push('$.process.run(argv 出現不只一次')
 
@@ -81,6 +88,8 @@ const KNOWN_POSITIVES = {
   工具觸發執行: s => ({ ...s, register: s.register.replace("const r = await issueText($, e.branch, e.target, 'tool')", "const r = await issueText($, e.branch, e.target, 'tool'); await runTicket($, 'x')") }),
   runTicket外執行argv: s => ({ ...s, register: s.register + '\nasync function y($, argv) { await $.process.run(argv) }\n' }),
   任意程式: s => ({ ...s, register: s.register + "\nasync function z($) { await $.process.run(['sh', '-c', 'x']) }\n" }),
+  mkdir換成任意程式: s => ({ ...s, register: s.register.replace("const mkdir = await posixTool($, 'mkdir', path)", "const mkdir = 'sh'") }),
+  posixTool回傳任意程式: s => ({ ...s, register: s.register.replace("if (path.startsWith('/')) return tool", "if (path.startsWith('/')) return 'sh'") }),
   白名單加push: s => ({ ...s, git: s.git.replace("'rev-parse',", "'rev-parse',\n  'push',") }),
   roGit外呼叫git: s => ({ ...s, git: s.git + "\nexport async function w(host) { return host.git(['push'], '/') }\n" }),
 }

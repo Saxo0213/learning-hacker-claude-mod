@@ -30,8 +30,10 @@ import {
   dirRefusal,
   expandDir,
   gitProbePaths,
+  NO_WINDOWS_SHELL,
   isMissionFileName,
   isUnder,
+  isWinPath,
   mapPool,
   missionNode,
   nextBlockedSince,
@@ -39,11 +41,14 @@ import {
   paneModel,
   parseMission,
   parseRoster,
+  pickHome,
+  normPath,
   pollDue,
   rejectionReason,
   sessionView,
   tildify,
   truncate,
+  windowsShellCandidates,
 } from './logic'
 import type { MissionSpec, PaneRow } from './logic'
 
@@ -64,6 +69,8 @@ let dirSetting = DEFAULT_DIR
 let inFlight = false
 let lastAttemptAt: number | null = null
 let demoIndex = 0
+/** 完成條件用的 shell（argv[0]）；undefined＝尚未找，null＝Windows 上找不到 */
+let shell: string | null | undefined
 
 function toast($: any, text: string): void {
   try {
@@ -71,9 +78,10 @@ function toast($: any, text: string): void {
   } catch {}
 }
 
+/** 解析後的路徑，Windows 路徑正規化成 `C:/…`。 */
 async function realPathOf($: any, path: string): Promise<string | undefined> {
   const st = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
-  return st?.realPath
+  return st?.realPath ? normPath(st.realPath) : undefined
 }
 
 type Located =
@@ -83,8 +91,8 @@ type Located =
 
 /** 找出 mission 目錄並檢查安全邊界。任何一步不確定都拒讀，不退而求其次。 */
 async function locate($: any): Promise<Located> {
-  const home = await $.env.get('HOME')
-  if (!home || !home.startsWith('/')) return { kind: 'refused', error: '讀不到家目錄（HOME 未設定），不讀任何 mission 檔' }
+  const home = pickHome(await $.env.get('USERPROFILE'), await $.env.get('HOME'))
+  if (!home) return { kind: 'refused', error: '讀不到家目錄（USERPROFILE／HOME 未設定），不讀任何 mission 檔' }
   if (dirSetting.trim() !== DEFAULT_DIR) {
     const userSettings = await $.settings.read({ source: 'user' }).catch(() => ({}))
     const refused = configRefusal(dirSetting, userSettings)
@@ -98,7 +106,7 @@ async function locate($: any): Promise<Located> {
   const dirStat = await $.fs.stat(expanded.path, { resolve: true }).catch(() => undefined)
   if (!dirStat) return { kind: 'missing', display }
   if (dirStat.kind !== 'dir' || !dirStat.realPath) return { kind: 'refused', error: `${display} 不是目錄` }
-  const realDir: string = dirStat.realPath
+  const realDir: string = normPath(dirStat.realPath)
   const projectDirs: string[] = []
   for (const p of [await $.session.root(), await $.session.cwd()]) projectDirs.push((await realPathOf($, p)) ?? p)
   const gitHits: string[] = []
@@ -122,7 +130,8 @@ async function loadMissions($: any, realDir: string): Promise<Loaded> {
   for (const name of names) {
     const path = `${realDir}/${name}`
     const st = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
-    if (!st?.realPath || !isUnder(st.realPath, realDir)) {
+    const realPath = st?.realPath ? normPath(st.realPath) : undefined
+    if (!st || !realPath || !isUnder(realPath, realDir)) {
       out.bad.push({ file: path, reason: '經符號連結指到 mission 目錄外，拒讀' })
       continue
     }
@@ -133,7 +142,7 @@ async function loadMissions($: any, realDir: string): Promise<Loaded> {
     }
     let text: string
     try {
-      text = await $.fs.read(st.realPath)
+      text = await $.fs.read(realPath)
     } catch (err) {
       out.bad.push({ file: path, reason: `讀檔失敗：${truncate(String(err), 60)}` })
       continue
@@ -148,7 +157,7 @@ async function loadMissions($: any, realDir: string): Promise<Loaded> {
       continue
     }
     ids.add(parsed.value.mission_id)
-    out.specs.push({ file: st.realPath, spec: parsed.value })
+    out.specs.push({ file: realPath, spec: parsed.value })
   }
   return out
 }
@@ -162,11 +171,34 @@ async function fetchRoster($: any): Promise<Roster> {
   }
 }
 
+/**
+ * 完成條件用的 shell。POSIX：/bin/sh。Windows（家目錄含磁碟代號）：Git for Windows 的 sh.exe，
+ * 依序找 CLAUDE_CODE_GIT_BASH_PATH 旁、Program Files、使用者安裝位置，再試 PATH 上的 `sh`；
+ * 都沒有回 null（不改用 cmd）。結果在模組存活期間沿用，/dispatch 重新開始時重找。
+ */
+async function findShell($: any, home: string): Promise<string | null> {
+  if (!isWinPath(home)) return '/bin/sh'
+  if (shell !== undefined) return shell
+  const env = {
+    gitBash: await $.env.get('CLAUDE_CODE_GIT_BASH_PATH'),
+    programFiles: await $.env.get('ProgramFiles'),
+    programW6432: await $.env.get('ProgramW6432'),
+    localAppData: await $.env.get('LOCALAPPDATA'),
+  }
+  for (const c of windowsShellCandidates(env)) {
+    if (await $.fs.exists(c).catch(() => false)) return (shell = c)
+  }
+  const onPath = await $.process.run(['sh', '-c', 'exit 0'], { timeoutMs: DONE_TIMEOUT_MS }).catch(() => undefined)
+  return (shell = onPath?.exitCode === 0 ? 'sh' : null)
+}
+
 /** 一條完成條件：`sh -c`，cwd 為家目錄，5 秒逾時；跑不起來或逾時＝無法判定。 */
 async function evaluate($: any, cmd: string, cwd: string): Promise<NodeEval> {
+  const sh = await findShell($, cwd)
+  if (sh === null) return { kind: 'unknown', reason: NO_WINDOWS_SHELL }
   const startedAt: number = await $.clock.now()
   try {
-    const r = await $.process.run(['/bin/sh', '-c', cmd], { cwd, timeoutMs: DONE_TIMEOUT_MS })
+    const r = await $.process.run([sh, '-c', cmd], { cwd, timeoutMs: DONE_TIMEOUT_MS })
     return classifyExit(r.exitCode, r.stderr)
   } catch (err) {
     return { kind: 'unknown', reason: rejectionReason(err, (await $.clock.now()) - startedAt) }
@@ -261,6 +293,7 @@ async function resetBaseline($: any): Promise<void> {
   await update($, failure, () => null)
   await update($, lastOkAt, () => null)
   lastAttemptAt = null
+  shell = undefined
 }
 
 async function onSessionStart($: any, e: any, next: any) {

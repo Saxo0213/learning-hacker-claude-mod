@@ -13,7 +13,7 @@ import type { Register } from 'claude-code'
 import type { Rendered, RunLog, TicketRow } from '../types'
 import * as git from './git'
 import type { Config, Host } from './git'
-import { GIT_TIMEOUT_MS, REMOTE_RE, STEP_TIMEOUT_MS, TICK_MS, TOAST_MS, argvText, bandText, branchNameShapeOk, checkLine, pending, preflight, runSteps, short, stepLine, truncate } from './logic'
+import { GIT_TIMEOUT_MS, REMOTE_RE, STEP_TIMEOUT_MS, TICK_MS, TOAST_MS, argvText, bandText, branchNameShapeOk, checkLine, gitToolCandidates, pending, preflight, runSteps, short, stepLine, truncate } from './logic'
 
 const PANE = 'handoff-runner'
 const TOOL = 'handoff_issue'
@@ -31,6 +31,30 @@ let common: string | null | undefined
 let inFlight = false
 let cfg: Config = { push: false, remote: 'origin' }
 let defaultTarget = 'main'
+
+const NO_WINDOWS_TOOL = 'Windows 上找不到 Git for Windows 的 mkdir.exe（裝 Git for Windows，或設定 CLAUDE_CODE_GIT_BASH_PATH），無法建立認領鎖'
+const posixTools: Partial<Record<'mkdir' | 'rmdir', string>> = {}
+
+/**
+ * 認領鎖用的 `mkdir`／`rmdir`。POSIX（路徑 `/` 開頭）用 PATH 上的；Windows（`C:/…`）系統本身沒有這兩個執行檔，
+ * 先找 Git for Windows 附的 `<Git>/usr/bin/*.exe`，都不在才用 PATH 上的（Claude Code 的程序通常帶著 Git 的 usr/bin）。
+ * 結果在模組存活期間沿用。
+ */
+async function posixTool($: any, tool: 'mkdir' | 'rmdir', path: string): Promise<string> {
+  if (path.startsWith('/')) return tool
+  const known = posixTools[tool]
+  if (known !== undefined) return known
+  const env = {
+    gitBash: await $.env.get('CLAUDE_CODE_GIT_BASH_PATH'),
+    programFiles: await $.env.get('ProgramFiles'),
+    programW6432: await $.env.get('ProgramW6432'),
+    localAppData: await $.env.get('LOCALAPPDATA'),
+  }
+  for (const c of gitToolCandidates(tool, env)) {
+    if (await $.fs.exists(c).catch(() => false)) return (posixTools[tool] = c)
+  }
+  return (posixTools[tool] = tool)
+}
 
 function host($: any): Host {
   return {
@@ -58,15 +82,19 @@ function host($: any): Host {
       }
     },
     mkdirExclusive: async path => {
+      const mkdir = await posixTool($, 'mkdir', path)
       try {
-        return (await $.process.run(['mkdir', path], { timeoutMs: GIT_TIMEOUT_MS })).exitCode === 0
-      } catch {
+        return (await $.process.run([mkdir, path], { timeoutMs: GIT_TIMEOUT_MS })).exitCode === 0
+      } catch (err) {
+        // Windows 上 mkdir 跑不起來＝沒有 Git for Windows：說清楚，不當成「鎖被別人拿走」
+        if (!path.startsWith('/')) throw new Error(`${NO_WINDOWS_TOOL}（${truncate(String(err), 80)}）`)
         return false
       }
     },
     rmdir: async path => {
+      const rmdir = await posixTool($, 'rmdir', path)
       try {
-        await $.process.run(['rmdir', path], { timeoutMs: GIT_TIMEOUT_MS })
+        await $.process.run([rmdir, path], { timeoutMs: GIT_TIMEOUT_MS })
       } catch {}
     },
     now: () => Date.now(),

@@ -112,18 +112,20 @@ P1、P2 不成立判 `stale`，P3、P4 不成立判 `blocked`，兩者都沒有�
 claude plugin validate ./plugins/handoff-runner
 ```
 
-v0.1.0 的結果：
+v0.1.1 的結果：
 
 ```
 hooks: session.start, tool.call{tool=mcp__handoff-runner__handoff_issue}, command.run{command=handoff},
        ui.close, ui.render{component=AbovePrompt}, ui.render{component=Pane, requestId=handoff-runner}
-calls: $.clock.every, $.command.register, $.fs.list, $.fs.read, $.fs.write, $.process.run,
-       $.session.cwd, $.state.get, $.state.set, $.tool.register, $.ui.close, $.ui.open,
+calls: $.clock.every, $.command.register, $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.write,
+       $.process.run, $.session.cwd, $.state.get, $.state.set, $.tool.register, $.ui.close, $.ui.open,
        $.ui.resolve, $.ui.toast
+env reads: CLAUDE_CODE_GIT_BASH_PATH, LOCALAPPDATA, ProgramFiles, ProgramW6432
 ```
 
 - `$.fs.*` 只讀寫 `<git common dir>/handoffs/` 底下的檔。
 - `$.process.run` 跑三種東西：唯讀的 git 檢查、`mkdir`／`rmdir`（認領鎖）、以及按下「執行」後的落地步驟。
+- Windows：git 給的路徑是 `C:/…`，照樣當絕對路徑（`\\server\share` 開頭的不收）。系統沒有 `mkdir`／`rmdir` 執行檔，改用 Git for Windows 的 `usr\bin\mkdir.exe`、`rmdir.exe`（依序找 `CLAUDE_CODE_GIT_BASH_PATH` 所在的 Git、`%ProgramFiles%\Git`、`%LOCALAPPDATA%\Programs\Git`，再退 PATH）；`$.env.get`、`$.fs.exists` 只用在這裡。找不到時按「執行」會 toast 原因，不做任何寫入。
 - `$.tool.register` 註冊簽發工具；它不執行任何 git 寫入。
 - 不連網，除非你開啟 `push`（此時會跑 `git ls-remote` 與 `git push`）。不呼叫模型、不改動任何 tool call 或 prompt。
 

@@ -14,6 +14,7 @@ import {
   ID_RE,
   LOCK_STALE_MS,
   SCHEMA,
+  absPath,
   branchNameShapeOk,
   buildSteps,
   fingerprint,
@@ -71,11 +72,10 @@ export async function roGit(host: Host, args: string[], cwd: string): Promise<Pr
   return host.git(args, cwd)
 }
 
-/** session 所在 repo 的 git common dir（絕對路徑）；不在 git repo 內回 null。 */
+/** session 所在 repo 的 git common dir（絕對路徑；Windows 為 `C:/…`）；不在 git repo 內回 null。 */
 export async function commonDir(host: Host, cwd: string): Promise<string | null> {
   const r = await roGit(host, ['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd)
-  const dir = r.exitCode === 0 ? r.stdout.trim().replace(/\/+$/, '') : ''
-  return dir.startsWith('/') ? dir : null
+  return r.exitCode === 0 ? absPath(r.stdout) : null
 }
 
 export async function rev(host: Host, common: string, ref: string): Promise<string | null> {

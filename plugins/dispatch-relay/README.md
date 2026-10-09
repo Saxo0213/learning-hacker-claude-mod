@@ -87,6 +87,8 @@ mission 目錄裡沒有任何 mission 寫了 `station` 時，mod 連名冊都不
 - **mission 檔從哪裡讀**：與 dispatch-board 相同的規則——只讀使用者層級目錄，否則 clone 一個陌生 repo 就能讓 mod 把你的檔案送給別人。
   - 預設 `~/.claude/missions/`。可在 `/plugin` 的設定改 `missions_dir`，但**只認 `~/.claude/settings.json` 裡的值**；專案設定給的值不採用。和 dispatch-board 一起用時兩邊要設成同一個目錄（兩個 mod 各自有設定）。
   - 目錄解析符號連結後必須在家目錄底下、不在本 session 的專案目錄內、不在任何 git 工作樹內。個別 mission 檔經符號連結指到目錄外的不讀。
+  - 家目錄：Windows 取 `USERPROFILE`（要含磁碟代號），其他取 `HOME`。Windows 上路徑比對前先統一斜線、不分大小寫，不同磁碟與網路路徑一律算在家目錄外。
+- **結果檔**：`result_file` 只收相對於 session 根目錄、以 `/` 分段的路徑；絕對路徑、`~`、反斜線、冒號（磁碟代號、NTFS 資料流）、`.`／`..` 段一律拒絕。讀檔前再以解析後的路徑確認仍在 session 根目錄底下。
 - **放行送件**：auto mode 下，plugin 的送件會被權限分類器擋下，所以 mod 在 `tool.check` 只放行**自己發出**的 `SendMessage`；其他來源（包括 worker 自己的 `SendMessage`）一律交給原本的流程，不攔截、不改寫、不放行。
 - 不寫任何檔案（狀態存在 plugin 自己的 `$.store`）、不執行 mission 檔的完成條件、不連網、不呼叫模型。
 
@@ -96,7 +98,7 @@ mission 目錄裡沒有任何 mission 寫了 `station` 時，mod 連名冊都不
 claude plugin validate ./plugins/dispatch-relay
 ```
 
-結果（v0.1.0）：
+結果（v0.1.1）：
 
 ```
 hooks: session.start, prompt.submit, prompt.compose, turn.start, tool.call{tool=SendMessage},
@@ -104,7 +106,7 @@ hooks: session.start, prompt.submit, prompt.compose, turn.start, tool.call{tool=
 calls: $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat, $.process.run,
        $.prompt.submit, $.session.cwd, $.session.id, $.session.root, $.session.send,
        $.settings.read, $.store.delete, $.store.get, $.store.set, $.ui.log
-env reads: HOME
+env reads: HOME, USERPROFILE
 env writes: nothing
 ```
 

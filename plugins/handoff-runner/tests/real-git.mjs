@@ -81,7 +81,8 @@ function commit(cwd, file, text) {
 
 /** repo（main checkout 在 main）＋ worktree（feature/x 比 main 多一個 commit）。 */
 function setup() {
-  const base = realpathSync(mkdtempSync(join(tmpdir(), 'handoff-runner-')))
+  // native：Windows 的暫存目錄可能是 8.3 短名（ADMINI~1），git 給的是展開後的長名
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'handoff-runner-')))
   const repo = join(base, 'repo')
   mkdirSync(repo)
   sh(repo, 'init', '-q', '-b', 'main')
@@ -131,7 +132,8 @@ it('持有者版：在 main checkout 裡 ff-merge，工作樹跟著前進', asyn
   ok(JSON.stringify(Object.keys(t.params).sort()) === '["branch","sha","target"]', '交接單只帶三個參數')
   const shown = await git.render(host, r.common, issued.ticket.id, LOCAL)
   ok(shown.status === 'ready', `status ${shown.status}: ${shown.reason}`)
-  ok(shown.steps[0].argv.join(' ') === `git -C ${r.repo} merge --ff-only ${r.c1}`, shown.steps[0].argv.join(' '))
+  // git 在 Windows 給 `C:/…`：與 Node 的 `C:\…` 比對前換成同一種斜線
+  ok(shown.steps[0].argv.join(' ') === `git -C ${r.repo.replace(/\\/g, '/')} merge --ff-only ${r.c1}`, shown.steps[0].argv.join(' '))
   ok(sh(r.repo, 'rev-parse', 'main') === r.c0, '執行前 main 不動')
   const res = await press(r.common, issued.ticket.id, shown)
   ok(res.outcome === 'passed', `outcome ${res.outcome}: ${res.summary}`)

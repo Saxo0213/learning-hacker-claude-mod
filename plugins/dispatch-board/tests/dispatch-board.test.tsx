@@ -5,7 +5,10 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import {
+  NO_WINDOWS_SHELL,
+  archiveCommand,
   bandText,
+  baseName,
   classifyExit,
   configRefusal,
   diffToasts,
@@ -13,11 +16,17 @@ import {
   expandDir,
   gitProbePaths,
   groupOf,
+  isSameOrUnder,
+  isUnder,
   needYou,
+  normPath,
   parseMission,
   parseRoster,
+  pickHome,
   rejectionReason,
   sessionView,
+  tildify,
+  windowsShellCandidates,
 } from '../hooks/logic'
 import type { BoardMission, BoardNode, BoardSnapshot } from '../types'
 
@@ -35,6 +44,14 @@ type World = {
   roster: unknown[] | 'fail'
   userSettings: Record<string, unknown>
   shCalls: string[]
+  /** 每次完成條件的 cwd */
+  shCwds: string[]
+  /** claude 以外每次 process.run 的 argv[0] */
+  procs: string[]
+  /** Windows：PATH 上有沒有 sh */
+  pathSh: boolean
+  /** session 根目錄與工作目錄；預設 PROJECT */
+  project?: string
   rosterCalls: number
   toasts: string[]
   opened: string[]
@@ -65,6 +82,9 @@ function world(on: any, w0: Partial<World> & { fs: Fs }, env: Record<string, str
     roster: [],
     userSettings: {},
     shCalls: [],
+    shCwds: [],
+    procs: [],
+    pathSh: false,
     rosterCalls: 0,
     toasts: [],
     opened: [],
@@ -72,29 +92,54 @@ function world(on: any, w0: Partial<World> & { fs: Fs }, env: Record<string, str
   }
   mock.env(on, env)
   const value = (v: unknown) => ({ value: v })
-  const resolve = (p: string) => w.fs.links.get(p) ?? p
+  // 引擎在 Windows 主機上會把 `/home/u/…` 解析成 `D:\home\u\…` 再交給 fs.*：比對前先還原。
+  // Windows 世界（USERPROFILE 有設）的路徑含磁碟代號、不分大小寫，realPath 回原生的反斜線寫法。
+  const win = env.USERPROFILE !== undefined
+  const key = (p: string) => {
+    const segs: string[] = []
+    for (const s of p.replace(/\\/g, '/').split('/')) {
+      if (s === '..') segs.pop()
+      else if (s !== '.') segs.push(s)
+    }
+    const s = segs.join('/')
+    return win ? s.toLowerCase() : s.replace(/^[A-Za-z]:(?=\/)/, '')
+  }
+  const find = (paths: Iterable<string>, p: string) => {
+    for (const x of paths) if (key(x) === key(p)) return x
+    return undefined
+  }
+  const native = (p: string) => (win ? p.replace(/\//g, '\\') : p)
+  const resolve = (p: string) => {
+    const link = find(w.fs.links.keys(), p)
+    return link !== undefined ? (w.fs.links.get(link) as string) : p
+  }
   on('fs.stat', (_$: any, e: any) => {
     const real = resolve(e.path)
-    const isLink = w.fs.links.has(e.path)
-    if (w.fs.dirs.has(real)) return value({ kind: 'dir', size: 0, mtimeMs: 0, isLink, ...(e.resolve ? { realPath: real } : {}) })
-    const text = w.fs.files.get(real)
-    if (text !== undefined) return value({ kind: 'file', size: text.length, mtimeMs: 0, isLink, ...(e.resolve ? { realPath: real } : {}) })
+    const isLink = find(w.fs.links.keys(), e.path) !== undefined
+    const dir = find(w.fs.dirs, real)
+    if (dir !== undefined) return value({ kind: 'dir', size: 0, mtimeMs: 0, isLink, ...(e.resolve ? { realPath: native(dir) } : {}) })
+    const file = find(w.fs.files.keys(), real)
+    const text = file === undefined ? undefined : w.fs.files.get(file)
+    if (file !== undefined && text !== undefined) return value({ kind: 'file', size: text.length, mtimeMs: 0, isLink, ...(e.resolve ? { realPath: native(file) } : {}) })
     return { deny: `ENOENT: ${e.path}` }
   })
-  on('fs.exists', (_$: any, e: any) => value(w.fs.dirs.has(e.path) || w.fs.files.has(e.path)))
+  on('fs.exists', (_$: any, e: any) => value(find(w.fs.dirs, e.path) !== undefined || find(w.fs.files.keys(), e.path) !== undefined))
   on('fs.list', (_$: any, e: any) => {
     const out: any[] = []
-    for (const d of w.fs.dirs) if (parentOf(d) === e.path && d !== e.path) out.push({ name: d.slice(e.path.length + 1), kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
-    for (const [f, t] of w.fs.files) if (parentOf(f) === e.path) out.push({ name: f.slice(e.path.length + 1), kind: 'file', size: t.length, mtimeMs: 0, isLink: false })
-    for (const l of w.fs.links.keys()) if (parentOf(l) === e.path) out.push({ name: l.slice(e.path.length + 1), kind: 'other', size: 0, mtimeMs: 0, isLink: true })
+    const under = (p: string) => key(parentOf(p)) === key(e.path)
+    const name = (p: string) => p.slice(p.lastIndexOf('/') + 1)
+    for (const d of w.fs.dirs) if (under(d) && key(d) !== key(e.path)) out.push({ name: name(d), kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
+    for (const [f, t] of w.fs.files) if (under(f)) out.push({ name: name(f), kind: 'file', size: t.length, mtimeMs: 0, isLink: false })
+    for (const l of w.fs.links.keys()) if (under(l)) out.push({ name: name(l), kind: 'other', size: 0, mtimeMs: 0, isLink: true })
     return value(out)
   })
   on('fs.read', (_$: any, e: any) => {
-    const t = w.fs.files.get(e.path)
+    const f = find(w.fs.files.keys(), e.path)
+    const t = f === undefined ? undefined : w.fs.files.get(f)
     return t === undefined ? { deny: `ENOENT: ${e.path}` } : value(t)
   })
-  on('session.root', () => value(PROJECT))
-  on('session.cwd', () => value(PROJECT))
+  on('session.root', () => value(w.project ?? PROJECT))
+  on('session.cwd', () => value(w.project ?? PROJECT))
   on('settings.read', () => value(w.userSettings))
   on('process.run', async (_$: any, e: any) => {
     const argv: readonly string[] = e.argv
@@ -104,9 +149,13 @@ function world(on: any, w0: Partial<World> & { fs: Fs }, env: Record<string, str
       w.rosterCalls += 1
       return w.roster === 'fail' ? ok(1, '', 'error: unknown command') : ok(0, JSON.stringify(w.roster))
     }
-    if (argv[0] === '/bin/sh') {
+    w.procs.push(argv[0] ?? '')
+    if (argv[0] === 'sh' && argv[2] === 'exit 0') return w.pathSh ? ok(0) : { deny: 'ENOENT: sh' }
+    const isShell = win ? argv[0] === 'sh' || (find(w.fs.files.keys(), argv[0] ?? '') !== undefined && /sh\.exe$/i.test(argv[0] ?? '')) : argv[0] === '/bin/sh'
+    if (isShell && argv[1] === '-c') {
       const cmd = argv[2] ?? ''
       w.shCalls.push(cmd)
+      w.shCwds.push(String(e.init?.cwd ?? ''))
       const r = w.sh.get(cmd) ?? 1
       if (r === 'throw') {
         // 引擎的逾時：跑滿 timeoutMs 才 reject，訊息不保證寫明是逾時
@@ -136,6 +185,19 @@ function world(on: any, w0: Partial<World> & { fs: Fs }, env: Record<string, str
 }
 
 const mission = (id: string, nodes: object[], extra: object = {}) => JSON.stringify({ mission_id: id, nodes, ...extra })
+
+// Windows 世界：家目錄來自 USERPROFILE（反斜線），專案在另一個磁碟，Git for Windows 裝在 Program Files。
+const W_HOME = 'C:/Users/Me'
+const W_DIR = `${W_HOME}/.claude/missions`
+const W_PROJECT = 'D:/code/proj'
+const W_SH = 'C:/Program Files/Git/bin/sh.exe'
+const W_ENV = { USERPROFILE: 'C:\\Users\\Me', HOME: '/c/Users/Me', ProgramFiles: 'C:\\Program Files' }
+
+function makeWinFs(files: Record<string, string>, extraDirs: string[] = [], withGit = true): Fs {
+  const fs = makeFs(files, [W_HOME, `${W_HOME}/.claude`, W_PROJECT, ...extraDirs])
+  if (withGit) fs.files.set(W_SH, '')
+  return fs
+}
 
 async function start($: any, on: any, w: World): Promise<void> {
   on('session.start', (_$: any, e: any) => ({ cwd: e.cwd }))
@@ -229,6 +291,80 @@ describe('logic', () => {
     expect(sessionView('w3', roster, { w3: 1 })).toEqual({ kind: 'gone' })
     expect(sessionView('w3', { available: false, note: 'x' }, { w3: 1 })).toEqual({ kind: 'unavailable' })
     expect(sessionView('', roster, {})).toEqual({ kind: 'none' })
+  })
+
+  test('Windows：家目錄先取 USERPROFILE，網路路徑與 Git Bash 的 /c/… 不當家目錄', async () => {
+    expect(pickHome('C:\\Users\\Me', '/c/Users/Me')).toBe('C:/Users/Me')
+    expect(pickHome(undefined, 'c:\\Users\\Me')).toBe('C:/Users/Me')
+    expect(pickHome(undefined, HOME)).toBe(HOME)
+    expect(pickHome('\\\\server\\home\\me', undefined)).toBe(null)
+    expect(pickHome('\\\\server\\home\\me', HOME)).toBe(HOME)
+    expect(pickHome(undefined, 'Users\\Me')).toBe(null)
+    expect(pickHome(undefined, undefined)).toBe(null)
+  })
+
+  test('Windows：expandDir 收 ~\\、C:\\、C:/，不收網路路徑、磁碟相對與根目錄相對路徑', async () => {
+    expect(expandDir('~/.claude/missions', W_HOME)).toEqual({ ok: true, path: W_DIR })
+    expect(expandDir('~\\.claude\\missions', W_HOME)).toEqual({ ok: true, path: W_DIR })
+    expect(expandDir('~', W_HOME)).toEqual({ ok: true, path: W_HOME })
+    expect(expandDir('c:\\Users\\Me\\m', W_HOME)).toEqual({ ok: true, path: 'C:/Users/Me/m' })
+    expect(expandDir('E:/m', W_HOME)).toEqual({ ok: true, path: 'E:/m' })
+    for (const bad of ['\\\\server\\share\\m', '//server/share/m', '/abs/m', '\\m', 'C:m', 'm', '~m']) {
+      expect(expandDir(bad, W_HOME).ok).toBe(false)
+    }
+    // POSIX 家目錄不收 Windows 寫法
+    expect(expandDir('C:/m', HOME).ok).toBe(false)
+    expect(expandDir('~\\m', HOME).ok).toBe(false)
+  })
+
+  test('Windows：路徑比對不分大小寫與斜線，不同磁碟、網路路徑、前綴相同的兄弟目錄都不算在底下', async () => {
+    expect(normPath('c:\\Users\\Me\\x')).toBe('C:/Users/Me/x')
+    expect(normPath('\\\\?\\C:\\Users\\Me')).toBe('C:/Users/Me')
+    expect(normPath('\\\\?\\UNC\\server\\share')).toBe('//server/share')
+    expect(normPath('/home/u/x\\y')).toBe('/home/u/x\\y')
+    expect(isUnder('c:\\users\\me\\.claude\\missions', W_HOME)).toBe(true)
+    expect(isUnder('\\\\?\\C:\\Users\\Me\\m', 'c:\\users\\me\\')).toBe(true)
+    expect(isUnder('C:/Users/Me', W_HOME)).toBe(false)
+    expect(isUnder('C:/Users/Me2/m', W_HOME)).toBe(false)
+    expect(isUnder('D:/Users/Me/m', W_HOME)).toBe(false)
+    expect(isUnder('\\\\server\\share\\Users\\Me\\m', W_HOME)).toBe(false)
+    expect(isUnder('//server/share/m', '\\\\server\\share')).toBe(true)
+    expect(isUnder('/Users/Me/m', W_HOME)).toBe(false)
+    expect(isUnder('C:/Users/Me/m', '/Users/Me')).toBe(false)
+    // POSIX 照舊分大小寫
+    expect(isUnder('/home/U/x', HOME)).toBe(false)
+    expect(isSameOrUnder('c:\\users\\me', W_HOME)).toBe(true)
+  })
+
+  test('Windows：dirRefusal 在解析後的路徑上同樣嚴格', async () => {
+    const base = { realHome: 'C:\\Users\\Me', realDir: 'C:\\Users\\Me\\.claude\\missions', projectDirs: ['D:\\code\\proj'], gitHits: [] }
+    expect(dirRefusal(base)).toBe(null)
+    // `C:\Users\Me\..\Other\m` 解析後在家目錄外
+    expect(dirRefusal({ ...base, realDir: 'C:\\Users\\Other\\m' })).toMatch(/不在家目錄/)
+    expect(dirRefusal({ ...base, realDir: 'E:\\Users\\Me\\m' })).toMatch(/不在家目錄/)
+    expect(dirRefusal({ ...base, realDir: '\\\\server\\share\\m' })).toMatch(/不在家目錄/)
+    expect(dirRefusal({ ...base, realDir: 'c:\\users\\me' })).toMatch(/不在家目錄/)
+    // 專案目錄的大小寫、斜線不同也擋
+    expect(dirRefusal({ ...base, realDir: 'c:/users/me/code/p/m', projectDirs: ['C:\\Users\\Me\\Code\\P'] })).toMatch(/專案目錄/)
+    expect(gitProbePaths('C:\\Users\\Me\\a\\b', 'c:/users/me')).toEqual(['C:/Users/Me/a/b/.git', 'C:/Users/Me/a/.git'])
+    expect(gitProbePaths('E:\\a\\b', 'C:\\Users\\Me')).toEqual([])
+    expect(tildify('c:\\users\\me\\.claude\\missions', 'C:\\Users\\Me')).toBe('~/.claude/missions')
+    expect(tildify('E:\\m', 'C:\\Users\\Me')).toBe('E:/m')
+    expect(baseName('C:\\Users\\Me\\m.json')).toBe('m.json')
+    expect(archiveCommand(`${W_DIR}/m.json`)).toBe(`mkdir -p '${W_DIR}/done' && mv '${W_DIR}/m.json' '${W_DIR}/done/'`)
+  })
+
+  test('Windows：sh 的候選只有 Git for Windows，不收 System32 的 bash（WSL）', async () => {
+    expect(windowsShellCandidates({ gitBash: 'D:\\Git\\bin\\bash.exe', programFiles: 'C:\\Program Files' })).toEqual([
+      'D:/Git/bin/sh.exe',
+      'D:/Git/bin/bash.exe',
+      'C:/Program Files/Git/bin/sh.exe',
+    ])
+    expect(windowsShellCandidates({ gitBash: 'C:\\Windows\\System32\\bash.exe' })).toEqual(['C:/Program Files/Git/bin/sh.exe'])
+    expect(windowsShellCandidates({ gitBash: '\\\\server\\git\\bin\\bash.exe', localAppData: 'C:\\Users\\Me\\AppData\\Local' })).toEqual([
+      'C:/Program Files/Git/bin/sh.exe',
+      'C:/Users/Me/AppData/Local/Programs/Git/bin/sh.exe',
+    ])
   })
 
   test('分組、needYou、band 與 toast', async () => {
@@ -437,6 +573,116 @@ describe('dispatch-board', () => {
     await w.clock.advance(120_000)
     expect(w.shCalls.length).toBe(before)
     expect(await texts($, BAND)).toEqual(['ENGINE_DEFAULT'])
+  })
+
+  test('Windows：USERPROFILE 底下的 mission 照常讀，完成條件用 Git for Windows 的 sh、cwd 為家目錄', async ($, on) => {
+    const w = world(on, { fs: makeWinFs({ [`${W_DIR}/ship.json`]: TWO_NODES }), sh: new Map([['check api', 0]]), project: W_PROJECT }, W_ENV)
+    await start($, on, w)
+    await dispatch($, w)
+    expect([...new Set(w.shCalls)].sort()).toEqual(['check api', 'check web'])
+    expect([...new Set(w.procs)]).toEqual([W_SH])
+    expect([...new Set(w.shCwds)]).toEqual([W_HOME])
+    expect(has(await texts($, BAND), /⧉ ship 1\/2/)).toBe(true)
+    expect(has(await texts($, PANE), /^mission 目錄 ~\/\.claude\/missions$/)).toBe(true)
+  })
+
+  test('Windows：沒有 Git for Windows 時完成條件一律無法判定，不改用 cmd', async ($, on) => {
+    const w = world(on, { fs: makeWinFs({ [`${W_DIR}/ship.json`]: TWO_NODES }, [], false), project: W_PROJECT }, W_ENV)
+    await start($, on, w)
+    await dispatch($, w)
+    expect(w.shCalls).toEqual([])
+    expect([...new Set(w.procs)]).toEqual(['sh'])
+    const pane = await texts($, PANE)
+    expect(has(pane, /^需要你（1）/)).toBe(true)
+    expect(pane.filter(l => l.includes(NO_WINDOWS_SHELL.slice(0, 40))).length).toBe(2)
+  })
+
+  test('Windows：PATH 上有 sh 時才用它', async ($, on) => {
+    const w = world(on, { fs: makeWinFs({ [`${W_DIR}/ship.json`]: TWO_NODES }, [], false), pathSh: true, sh: new Map([['check api', 0]]), project: W_PROJECT }, W_ENV)
+    await start($, on, w)
+    await dispatch($, w)
+    expect([...new Set(w.shCalls)].sort()).toEqual(['check api', 'check web'])
+  })
+
+  test('Windows：沒有 USERPROFILE、HOME 是 Git Bash 的 /c/… 寫法：解析不了就整個停用', async ($, on) => {
+    const w = world(on, { fs: makeWinFs({ [`${W_DIR}/ship.json`]: TWO_NODES }), project: W_PROJECT }, { HOME: '/c/Users/Me' })
+    await start($, on, w)
+    await dispatch($, w)
+    expect(w.shCalls).toEqual([])
+    expect(has(await texts($, BAND), /家目錄 \/c\/Users\/Me 解析不了/)).toBe(true)
+  })
+
+  const ESCAPE = 'C:\\Users\\Me\\..\\Other\\missions'
+  test('Windows 安全：用 .. 繞出家目錄的自訂目錄拒讀', { options: { missions_dir: ESCAPE } }, async ($, on) => {
+    const w = world(
+      on,
+      {
+        fs: makeWinFs({ ['C:/Users/Other/missions/a.json']: mission('a', [{ id: 'x', done: 'touch pwned' }]) }),
+        userSettings: { pluginConfigs: { 'dispatch-board': { options: { missions_dir: ESCAPE } } } },
+        project: W_PROJECT,
+      },
+      W_ENV,
+    )
+    await start($, on, w)
+    await dispatch($, w)
+    expect(w.shCalls).toEqual([])
+    expect(has(await texts($, PANE), /C:\/Users\/Other\/missions 不在家目錄底下，拒讀/)).toBe(true)
+  })
+
+  const UNC = '\\\\server\\share\\missions'
+  test('Windows 安全：網路路徑的自訂目錄拒讀', { options: { missions_dir: UNC } }, async ($, on) => {
+    const w = world(
+      on,
+      { fs: makeWinFs({}), userSettings: { pluginConfigs: { 'dispatch-board': { options: { missions_dir: UNC } } } }, project: W_PROJECT },
+      W_ENV,
+    )
+    await start($, on, w)
+    await dispatch($, w)
+    expect(w.shCalls).toEqual([])
+    expect(has(await texts($, PANE), /不收網路路徑/)).toBe(true)
+  })
+
+  const IN_PROJECT = 'c:\\users\\me\\code\\proj\\missions'
+  test('Windows 安全：大小寫、斜線不同的專案目錄照樣拒讀', { options: { missions_dir: IN_PROJECT } }, async ($, on) => {
+    const w = world(
+      on,
+      {
+        fs: makeWinFs({ [`${W_HOME}/Code/Proj/missions/a.json`]: mission('a', [{ id: 'x', done: 'touch pwned' }]) }),
+        userSettings: { pluginConfigs: { 'dispatch-board': { options: { missions_dir: IN_PROJECT } } } },
+        project: 'C:\\Users\\Me\\Code\\Proj',
+      },
+      W_ENV,
+    )
+    await start($, on, w)
+    await dispatch($, w)
+    expect(w.shCalls).toEqual([])
+    expect(has(await texts($, PANE), /專案目錄內，拒讀/)).toBe(true)
+  })
+
+  test('Windows 安全：mission 目錄在 git 工作樹內就拒讀', { options: { missions_dir: '~/repo/missions' } }, async ($, on) => {
+    const w = world(
+      on,
+      {
+        fs: makeWinFs({ [`${W_HOME}/repo/missions/a.json`]: mission('a', [{ id: 'x', done: 'touch pwned' }]) }, [`${W_HOME}/repo/.git`]),
+        userSettings: { pluginConfigs: { 'dispatch-board': { options: { missions_dir: '~/repo/missions' } } } },
+        project: W_PROJECT,
+      },
+      W_ENV,
+    )
+    await start($, on, w)
+    await dispatch($, w)
+    expect(w.shCalls).toEqual([])
+    expect(has(await texts($, PANE), /git 工作樹內.*拒讀/)).toBe(true)
+  })
+
+  test('Windows 安全：經符號連結指到其他磁碟的 mission 檔拒讀', async ($, on) => {
+    const fs = makeWinFs({ ['E:/x/m.json']: mission('m', [{ id: 'x', done: 'touch pwned' }]) }, [W_DIR])
+    fs.links.set(`${W_DIR}/m.json`, 'E:/x/m.json')
+    const w = world(on, { fs, project: W_PROJECT }, W_ENV)
+    await start($, on, w)
+    await dispatch($, w)
+    expect(w.shCalls).toEqual([])
+    expect(has(await texts($, PANE), /m\.json · 經符號連結指到 mission 目錄外/)).toBe(true)
   })
 
   test('demo 模式：假資料，不讀目錄、不執行指令', async ($, on) => {

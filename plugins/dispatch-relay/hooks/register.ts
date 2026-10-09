@@ -35,9 +35,11 @@ import {
   injectionText,
   isMissionFileName,
   isUnder,
+  normPath,
   ownName,
   parseMission,
   parseRoster,
+  pickHome,
   resolveStation,
   sendCheckVerdict,
   truncate,
@@ -74,17 +76,18 @@ function logInactive($: any, text: string): void {
 
 // ── mission 目錄（安全邊界與 dispatch-board 相同）────────────────────────────
 
+/** 解析後的路徑，Windows 路徑正規化成 `C:/…`。 */
 async function realPathOf($: any, path: string): Promise<string | undefined> {
   const st = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
-  return st?.realPath
+  return st?.realPath ? normPath(st.realPath) : undefined
 }
 
 type Located = { kind: 'ok'; realDir: string } | { kind: 'missing' } | { kind: 'refused'; error: string }
 
 /** 找出 mission 目錄並檢查安全邊界。任何一步不確定都拒讀，不退而求其次。 */
 async function locate($: any): Promise<Located> {
-  const home = await $.env.get('HOME')
-  if (!home || !home.startsWith('/')) return { kind: 'refused', error: '讀不到家目錄（HOME 未設定），不讀任何 mission 檔' }
+  const home = pickHome(await $.env.get('USERPROFILE'), await $.env.get('HOME'))
+  if (!home) return { kind: 'refused', error: '讀不到家目錄（USERPROFILE／HOME 未設定），不讀任何 mission 檔' }
   if (dirSetting.trim() !== DEFAULT_DIR) {
     const userSettings = await $.settings.read({ source: 'user' }).catch(() => ({}))
     const refused = configRefusal(dirSetting, userSettings)
@@ -97,7 +100,7 @@ async function locate($: any): Promise<Located> {
   const dirStat = await $.fs.stat(expanded.path, { resolve: true }).catch(() => undefined)
   if (!dirStat) return { kind: 'missing' }
   if (dirStat.kind !== 'dir' || !dirStat.realPath) return { kind: 'refused', error: `${expanded.path} 不是目錄` }
-  const realDir: string = dirStat.realPath
+  const realDir: string = normPath(dirStat.realPath)
   const projectDirs: string[] = []
   for (const p of [await $.session.root(), await $.session.cwd()]) projectDirs.push((await realPathOf($, p)) ?? p)
   const gitHits: string[] = []
@@ -118,10 +121,11 @@ async function loadMissions($: any, realDir: string): Promise<RelayMission[]> {
   const ids = new Set<string>()
   for (const name of names) {
     const st = await $.fs.stat(`${realDir}/${name}`, { resolve: true }).catch(() => undefined)
-    if (!st?.realPath || !isUnder(st.realPath, realDir) || st.kind !== 'file' || st.size > MAX_FILE_BYTES) continue
+    const realPath = st?.realPath ? normPath(st.realPath) : undefined
+    if (!st || !realPath || !isUnder(realPath, realDir) || st.kind !== 'file' || st.size > MAX_FILE_BYTES) continue
     let text: string
     try {
-      text = await $.fs.read(st.realPath)
+      text = await $.fs.read(realPath)
     } catch {
       continue
     }
@@ -218,10 +222,12 @@ async function degrade($: any, id: Identity, built: Built, reason: string): Prom
 /** 讀結果檔；不存在回 null。解析符號連結後不在 session 根目錄底下的一律不讀——它的內容會被送出去。 */
 async function readResult($: any, root: string, file: string): Promise<string | null> {
   try {
-    const realRoot = (await realPathOf($, root)) ?? root
-    const st = await $.fs.stat(`${root}/${file}`, { resolve: true }).catch(() => undefined)
+    const realRoot = (await realPathOf($, root)) ?? normPath(root)
+    // root 可能是 `C:\proj`：組路徑一律在正規化後的 `C:/proj` 上，file 只含 `/`（checkResultFile）
+    const st = await $.fs.stat(`${normPath(root).replace(/\/+$/, '')}/${file}`, { resolve: true }).catch(() => undefined)
     if (!st) return null
-    if (!st.realPath || !isUnder(st.realPath, realRoot)) {
+    const realPath = st.realPath ? normPath(st.realPath) : undefined
+    if (!realPath || !isUnder(realPath, realRoot)) {
       log($, `結果檔 ${file} 解析後不在 session 根目錄底下，不讀也不送`)
       return null
     }
@@ -230,7 +236,7 @@ async function readResult($: any, root: string, file: string): Promise<string | 
       log($, `結果檔 ${file} 超過 ${MAX_FILE_BYTES / 1024} KB，不送`)
       return null
     }
-    return String(await $.fs.read(st.realPath))
+    return String(await $.fs.read(realPath))
   } catch {
     return null
   }

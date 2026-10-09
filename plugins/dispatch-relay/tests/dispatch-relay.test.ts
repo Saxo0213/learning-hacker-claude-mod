@@ -13,10 +13,15 @@ import {
   degradeFailedLine,
   degradePrompt,
   dirRefusal,
+  expandDir,
   findIdentity,
+  gitProbePaths,
   injectionText,
+  isUnder,
+  normPath,
   parseMission,
   parseRoster,
+  pickHome,
   resolveStation,
   sendCheckVerdict,
   submitFailure,
@@ -104,6 +109,30 @@ describe('logic：mission 檔與結果檔路徑', () => {
   test('checkResultFile：子目錄可以', async () => {
     expect(checkResultFile('reports/api.md')).toEqual({ ok: true, path: 'reports/api.md' })
     expect(checkResultFile('')).toEqual({ ok: true, path: '.mission-result.md' })
+  })
+
+  test('checkResultFile：Windows 寫法（反斜線、磁碟代號、網路路徑、NTFS 資料流）一律拒絕', async () => {
+    for (const rf of ['reports\\api.md', 'C:\\x.md', 'C:/x.md', 'C:x.md', '\\\\server\\share\\x.md', '//server/share/x.md', '.mission-result.md:secret', '..\\x.md']) {
+      expect(checkResultFile(rf).ok).toBe(false)
+    }
+  })
+
+  test('Windows：家目錄、expandDir、dirRefusal 與 dispatch-board 同一套規則', async () => {
+    expect(pickHome('C:\\Users\\Me', '/c/Users/Me')).toBe('C:/Users/Me')
+    expect(pickHome(undefined, HOME)).toBe(HOME)
+    expect(pickHome('\\\\server\\home\\me', undefined)).toBe(null)
+    expect(expandDir('~\\.claude\\missions', 'C:/Users/Me')).toEqual({ ok: true, path: 'C:/Users/Me/.claude/missions' })
+    for (const bad of ['\\\\server\\share\\m', '//server/share/m', '/abs/m', 'C:m']) expect(expandDir(bad, 'C:/Users/Me').ok).toBe(false)
+    const base = { realHome: 'C:\\Users\\Me', realDir: 'c:\\users\\me\\.claude\\missions', projectDirs: ['C:\\Users\\Me\\code\\shop'], gitHits: [] }
+    expect(dirRefusal(base)).toBe(null)
+    expect(dirRefusal({ ...base, realDir: 'C:\\Users\\Other\\m' })).toMatch(/不在家目錄/)
+    expect(dirRefusal({ ...base, realDir: 'D:\\Users\\Me\\m' })).toMatch(/不在家目錄/)
+    expect(dirRefusal({ ...base, realDir: '\\\\server\\share\\Users\\Me\\m' })).toMatch(/不在家目錄/)
+    expect(dirRefusal({ ...base, realDir: 'C:/USERS/ME/CODE/SHOP/m' })).toMatch(/專案目錄/)
+    expect(gitProbePaths('C:\\Users\\Me\\a\\b', 'c:/users/me')).toEqual(['C:/Users/Me/a/b/.git', 'C:/Users/Me/a/.git'])
+    expect(isUnder('\\\\?\\C:\\Users\\Me\\m', 'C:/Users/Me')).toBe(true)
+    expect(isUnder('C:/Users/Me2/m', 'C:/Users/Me')).toBe(false)
+    expect(normPath('c:\\x\\y')).toBe('C:/x/y')
   })
 
   test('dirRefusal／configRefusal：與 dispatch-board 同一套規則，設定鍵是本 mod 的', async () => {
@@ -238,9 +267,23 @@ function parentOf(p: string): string {
   return p.slice(0, p.lastIndexOf('/')) || '/'
 }
 
-function world(on: any, opts: { files?: Record<string, string>; send?: SendReply[]; submit?: SubmitReply[]; roster?: object[] | 'fail' } = {}): World {
+type WorldOpts = {
+  files?: Record<string, string>
+  send?: SendReply[]
+  submit?: SubmitReply[]
+  roster?: object[] | 'fail'
+  /** 環境變數；預設只有 HOME。有 USERPROFILE＝Windows 世界 */
+  env?: Record<string, string>
+  /** session 根目錄（引擎回傳的原樣）；預設 ROOT */
+  root?: string
+  dirs?: string[]
+}
+
+function world(on: any, opts: WorldOpts = {}): World {
+  const env = opts.env ?? { HOME }
+  const root = opts.root ?? ROOT
   const w: World = {
-    dirs: new Set([HOME, `${HOME}/.claude`, DIR, `${HOME}/code`, ROOT]),
+    dirs: new Set(opts.dirs ?? [HOME, `${HOME}/.claude`, DIR, `${HOME}/code`, ROOT]),
     files: new Map(Object.entries(opts.files ?? { [`${DIR}/shop.json`]: mission({ nodes: NODES }) })),
     links: new Map(),
     userSettings: {},
@@ -257,31 +300,55 @@ function world(on: any, opts: { files?: Record<string, string>; send?: SendReply
     storeAtPrompt: [],
   }
   const value = (v: unknown) => ({ value: v })
+  // 引擎在 Windows 主機上會把 `/home/u/…` 解析成 `D:\home\u\…` 再交給 fs.*：比對前先還原。
+  // Windows 世界的路徑含磁碟代號、不分大小寫，realPath 回原生的反斜線寫法。
+  const win = env.USERPROFILE !== undefined
+  const canon = (p: string) => {
+    const segs: string[] = []
+    for (const s of p.replace(/\\/g, '/').split('/')) {
+      if (s === '..') segs.pop()
+      else if (s !== '.') segs.push(s)
+    }
+    const s = segs.join('/')
+    return win ? s : s.replace(/^[A-Za-z]:(?=\/)/, '')
+  }
+  const key = (p: string) => (win ? canon(p).toLowerCase() : canon(p))
+  const find = (paths: Iterable<string>, p: string) => {
+    for (const x of paths) if (key(x) === key(p)) return x
+    return undefined
+  }
+  const native = (p: string) => (win ? p.replace(/\//g, '\\') : p)
   const real = (p: string) => {
-    for (const [from, to] of w.links) if (p === from || p.startsWith(`${from}/`)) return to + p.slice(from.length)
+    const c = canon(p)
+    for (const [from, to] of w.links) {
+      const f = canon(from)
+      if (key(c) === key(f) || key(c).startsWith(`${key(f)}/`)) return to + c.slice(f.length)
+    }
     return p
   }
-  on('env.get', (_$: any, e: any) => value(e.name === 'HOME' ? HOME : undefined))
+  on('env.get', (_$: any, e: any) => value(env[e.name]))
   on('settings.read', () => value(w.userSettings))
-  on('session.root', () => value(ROOT))
-  on('session.cwd', () => value(ROOT))
+  on('session.root', () => value(root))
+  on('session.cwd', () => value(root))
   on('session.id', () => value(w.sessionId))
   on('fs.stat', (_$: any, e: any) => {
     const r = real(e.path)
-    const extra = e.resolve ? { realPath: r } : {}
-    if (w.dirs.has(r)) return value({ kind: 'dir', size: 0, mtimeMs: 0, isLink: false, ...extra })
-    const t = w.files.get(r)
-    if (t !== undefined) return value({ kind: 'file', size: t.length, mtimeMs: 0, isLink: false, ...extra })
+    const dir = find(w.dirs, r)
+    if (dir !== undefined) return value({ kind: 'dir', size: 0, mtimeMs: 0, isLink: false, ...(e.resolve ? { realPath: native(dir) } : {}) })
+    const file = find(w.files.keys(), r)
+    const t = file === undefined ? undefined : w.files.get(file)
+    if (file !== undefined && t !== undefined) return value({ kind: 'file', size: t.length, mtimeMs: 0, isLink: false, ...(e.resolve ? { realPath: native(file) } : {}) })
     return { deny: `ENOENT: ${e.path}` }
   })
-  on('fs.exists', (_$: any, e: any) => value(w.dirs.has(e.path) || w.files.has(e.path)))
+  on('fs.exists', (_$: any, e: any) => value(find(w.dirs, e.path) !== undefined || find(w.files.keys(), e.path) !== undefined))
   on('fs.list', (_$: any, e: any) => {
     const out: any[] = []
-    for (const [f, t] of w.files) if (parentOf(f) === e.path) out.push({ name: f.slice(e.path.length + 1), kind: 'file', size: t.length, mtimeMs: 0, isLink: false })
+    for (const [f, t] of w.files) if (key(parentOf(f)) === key(e.path)) out.push({ name: f.slice(f.lastIndexOf('/') + 1), kind: 'file', size: t.length, mtimeMs: 0, isLink: false })
     return value(out)
   })
   on('fs.read', (_$: any, e: any) => {
-    const t = w.files.get(e.path)
+    const f = find(w.files.keys(), e.path)
+    const t = f === undefined ? undefined : w.files.get(f)
     return t === undefined ? { deny: `ENOENT: ${e.path}` } : value(t)
   })
   on('process.run', (_$: any, e: any) => {
@@ -598,6 +665,56 @@ describe('降級', () => {
     await runTurn($, '')
     expect(w.sends[1]!.text).toContain('parts=result-full')
     expect(w.store.get(KEY)).toBe('A\n')
+  })
+})
+
+// Windows 世界：家目錄來自 USERPROFILE，session 根目錄是引擎給的反斜線寫法。
+const W_HOME = 'C:/Users/Me'
+const W_DIR = `${W_HOME}/.claude/missions`
+const W_ROOT = `${W_HOME}/code/shop`
+const W_ENV = { USERPROFILE: 'C:\\Users\\Me', HOME: '/c/Users/Me' }
+const winWorld = (on: any, files: Record<string, string>, root = 'C:\\Users\\Me\\code\\shop') =>
+  world(on, { files, env: W_ENV, root, dirs: [W_HOME, `${W_HOME}/.claude`, W_DIR, `${W_HOME}/code`, W_ROOT] })
+
+describe('Windows', () => {
+  test('USERPROFILE 底下的 mission 啟用；反斜線的 session 根目錄照樣讀到結果檔並轉送', async ($: any, on: any) => {
+    const w = winWorld(on, { [`${W_DIR}/shop.json`]: mission({ nodes: NODES }), [`${W_ROOT}/.mission-result.md`]: '回報' })
+    await start($, on)
+    expect(await composeIds($)).toEqual(['dispatch-relay:relay'])
+    expect(await runTurn($, '')).toMatch(/已送達指揮站 shop-lead/)
+    expect(w.sends[0]!.text).toContain('--- result-full ---\n回報')
+  })
+
+  test('session 根目錄的大小寫和實際不同也讀得到（比對不分大小寫）', async ($: any, on: any) => {
+    const nodes = [{ id: 'api', session: 'shop-api', result_file: 'reports/api.md' }]
+    const w = winWorld(on, { [`${W_DIR}/shop.json`]: mission({ nodes }), [`${W_ROOT}/reports/api.md`]: '報告' }, 'c:\\users\\me\\CODE\\shop\\')
+    w.dirs.add(`${W_ROOT}/reports`)
+    await start($, on)
+    await runTurn($, '')
+    expect(w.sends[0]!.text).toContain('--- result-full ---\n報告')
+  })
+
+  for (const target of ['E:/secret.txt', `${W_HOME}/code/shop2/secret.txt`]) {
+    test(`安全：結果檔經符號連結指到 ${target}（session 根目錄外），不讀也不送`, async ($: any, on: any) => {
+      const w = winWorld(on, { [`${W_DIR}/shop.json`]: mission({ nodes: NODES }), [target]: '機密' })
+      w.links.set(`${W_ROOT}/.mission-result.md`, target)
+      await start($, on)
+      await runTurn($, '')
+      expect(w.sends).toEqual([])
+      expect(w.logs.some(l => l.includes('不在 session 根目錄底下'))).toBe(true)
+    })
+  }
+
+  test('安全：沒有 USERPROFILE、HOME 是 Git Bash 的 /c/… 寫法：解析不了就不啟用，不讀名冊', async ($: any, on: any) => {
+    const w = world(on, {
+      files: { [`${W_DIR}/shop.json`]: mission({ nodes: NODES }) },
+      env: { HOME: '/c/Users/Me' },
+      dirs: [W_HOME, `${W_HOME}/.claude`, W_DIR],
+    })
+    await start($, on)
+    expect(await composeIds($)).toEqual([])
+    expect(w.rosterCalls).toBe(0)
+    expect(w.logs.some(l => l.includes('解析不了'))).toBe(true)
   })
 })
 

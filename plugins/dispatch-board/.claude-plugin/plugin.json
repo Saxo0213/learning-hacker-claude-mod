@@ -1,6 +1,6 @@
 {
   "name": "dispatch-board",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "多個 Claude Code session 分工時的派工看板：讀你寫的 mission 檔，顯示誰完成、誰在跑、誰在等你，狀態轉換時跳 toast",
   "author": { "name": "Hangghost", "url": "https://github.com/Hangghost" },
   "types": "./types/index.d.ts",
